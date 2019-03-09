@@ -47,9 +47,9 @@ uint16_t readBat() { return analogRead(A1) * (6.6 / 1024 * 100); }
 void initProximitySensor(uint8_t threshold, uint8_t ledDrive, uint8_t gain) {
 
   if (apds.init()) {
-    Serial.println(F("APDS-9960 initialization complete"));
+    PRINT_DEBUG(1,F("APDS-9960 initialization complete"));
   } else {
-    Serial.println(F("Something went wrong during APDS-9960 init!"));
+    PRINT_DEBUG(1,F("Something went wrong during APDS-9960 init!"));
   }
 
   // Set proximity interrupt thresholds
@@ -79,7 +79,6 @@ void waitBatOk() {
     disableProximitySensor();
     while (batLevel < 370) {
       PRINT_DEBUG(1, F("Bat level %i"), batLevel);
-      Serial.flush();
       powersave(OsDeltaTime::from_sec(30), []() { return false; });
       delay(200);
       batLevel = readBat();
@@ -181,28 +180,23 @@ void do_send() {
     pinMode(pinCmd, OUTPUT);
     digitalWrite(pinCmd, 1);
     delay(100);
-    uint8_t data[11];
+    uint8_t data[5];
     // battery
-    data[0] = 1;
-    data[1] = 2;
+    uint8_t i=0;
     uint16_t val = readBat();
-    data[2] = val >> 8;
-    data[3] = val;
+    data[i++] = val >> 8;
+    data[i++] = val;
 
-    data[4] = 2;
-    data[5] = 2;
     uint8_t prox;
     apds.readProximity(prox);
     val = prox * 100;
-    data[6] = val >> 8;
-    data[7] = val;
-
-    data[8] = 3;
-    data[9] = 0;
-    data[10] = apds_tosend > 0 ? 1 : 0;
+    data[i++] = val >> 8;
+    data[i++] = val;
+    // signal
+    data[i++] = apds_tosend > 0 ? 1 : 0;
 
     // Prepare upstream data transmission at the next possible time.
-    LMIC.setTxData2(1, (uint8_t *)data, 11, false);
+    LMIC.setTxData2(10, (uint8_t *)data, 5, false);
     PRINT_DEBUG(1,F("Packet queued"));
   }
   // Next TX is scheduled after TX_COMPLETE event.
@@ -259,7 +253,7 @@ void setup() {
   SetupLmicKey<appEui, devEui, appKey>::setup(LMIC);
 
   // set clock error to allow good connection.
-  LMIC.setClockError(MAX_CLOCK_ERROR * 3 / 100);
+  LMIC.setClockError(MAX_CLOCK_ERROR * 5 / 100);
   //    LMIC.setAntennaPowerAdjustment(-10);
 
   testDuration(15000);
