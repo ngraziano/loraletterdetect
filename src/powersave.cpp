@@ -5,7 +5,7 @@
 #include <lmic.h>
 #include <sleepandwatchdog.h>
 
-const int64_t sleepAdj = 1080;
+const int64_t sleepAdj = 997;
 
 void powersave(OsDeltaTime maxTime, stopsleepcb_t interrupt) {
   OsDeltaTime duration_selected;
