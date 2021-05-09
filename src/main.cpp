@@ -1,6 +1,6 @@
 
 #include <Arduino.h>
-
+#include <SPI.h>
 #include <hal/hal_io.h>
 #include <hal/print_debug.h>
 #include <keyhandler.h>
@@ -8,7 +8,7 @@
 
 #include <SparkFun_APDS9960.h>
 #include <sleepandwatchdog.h>
-
+#include <algorithm>
 #define DEVICE_POSTDETECT
 #include "lorakeys.h"
 #include "powersave.h"
@@ -29,14 +29,15 @@ const unsigned int BAUDRATE = 19200;
 // Pin mapping
 const lmic_pinmap lmic_pins = {
     .nss = 10,
-    .rxtx = LMIC_UNUSED_PIN,
+    .prepare_antenna_tx = nullptr,
     .rst = 14,
     .dio = {9, 8},
 };
-OsScheduler OSS;
-LmicEu868 LMIC(lmic_pins, OSS);
 
-OsJob sendjob{OSS};
+RadioSx1276 radio{lmic_pins};
+LmicEu868 LMIC(radio);
+
+OsTime nextSend;
 
 const uint8_t NUMBERTIME_TO_SEND = 3;
 uint8_t apds_tosend = 0;
@@ -75,7 +76,7 @@ void enableProximitySensor() {
 void waitBatOk() {
   auto batLevel = readBat();
   // wait here for battery to gain a little of charge
-  if (batLevel < 360) {
+  if (batLevel < 360 && batLevel>100) {
     disableProximitySensor();
     while (batLevel < 370) {
       PRINT_DEBUG(1, F("Bat level %i"), batLevel);
@@ -100,24 +101,15 @@ void apdsInterrupt() {
 
 void onEvent(EventType ev) {
   rst_wdt();
+  
   switch (ev) {
-  case EventType::JOINING:
-    PRINT_DEBUG(2, F("EV_JOINING"));
-    //        LMIC.setDrJoin(0);
-    break;
   case EventType::JOINED:
     PRINT_DEBUG(2, F("EV_JOINED"));
     LMIC.setDutyRate(11);
     break;
-  case EventType::JOIN_FAILED:
-    PRINT_DEBUG(2, F("EV_JOIN_FAILED"));
-    break;
-  case EventType::REJOIN_FAILED:
-    PRINT_DEBUG(2, F("EV_REJOIN_FAILED"));
-    break;
   case EventType::TXCOMPLETE:
     PRINT_DEBUG(2, F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-    waitBatOk();
+//    waitBatOk();
     if (LMIC.getTxRxFlags().test(TxRxStatus::ACK))
       PRINT_DEBUG(1, F("Received ack"));
     if (LMIC.getDataLen() >= 3) {
@@ -133,73 +125,50 @@ void onEvent(EventType ev) {
         }
       }
     }
-    // we have transmit
-    if (apds_tosend) {
-      PRINT_DEBUG(1, F("Schedule reset and send"));
-      // schedule back to off
-      sendjob.setTimedCallback(os_getTime() + TX_ONLENGTH, reset_and_do_send);
-    } else {
-      PRINT_DEBUG(1, F("Schedule send"));
-      // Schedule next transmission
-      sendjob.setTimedCallback(os_getTime() + TX_INTERVAL, do_send);
-    }
-
-    break;
-  case EventType::RESET:
-    PRINT_DEBUG(2, F("EV_RESET"));
-    break;
-  case EventType::LINK_DEAD:
-    PRINT_DEBUG(2, F("EV_LINK_DEAD"));
-    break;
-  case EventType::LINK_ALIVE:
-    PRINT_DEBUG(2, F("EV_LINK_ALIVE"));
-    break;
-  default:
-    PRINT_DEBUG(2, F("Unknown event"));
     break;
   }
 }
 
 void reset_and_do_send() {
   // we have sent one
-  if (apds_tosend > 0)
+  if (apds_tosend > 0) {
     apds_tosend--;
-  if (apds_tosend == 0)
-    apds.clearProximityInt();
+    if (apds_tosend == 0)
+      apds.clearProximityInt();
+  } 
+
   do_send();
+  nextSend = os_getTime() + (apds_tosend ? TX_ONLENGTH :TX_INTERVAL);
 }
 
 void do_send() {
-  // Check if there is not a current TX/RX job running
-  if (LMIC.getOpMode().test(OpState::TXRXPEND)) {
-    PRINT_DEBUG(1,F("OpState::TXRXPEND, not sending"));
-    // should not happen so reschedule anymway
-    sendjob.setTimedCallback(os_getTime() + TX_INTERVAL, do_send);
-  } else {
-    const uint8_t pinCmd = 6;
-    pinMode(pinCmd, OUTPUT);
-    digitalWrite(pinCmd, 1);
-    delay(100);
-    uint8_t data[5];
-    // battery
-    uint8_t i=0;
-    uint16_t val = readBat();
-    data[i++] = val >> 8;
-    data[i++] = val;
+  const uint8_t pinCmd = 6;
+  pinMode(pinCmd, OUTPUT);
+  digitalWrite(pinCmd, 1);
+  delay(100);
+  uint8_t data[5];
+  // battery
+  uint8_t i=0;
+  uint16_t val = readBat();
+  data[i++] = val >> 8;
+  data[i++] = val;
 
-    uint8_t prox;
-    apds.readProximity(prox);
-    val = prox * 100;
-    data[i++] = val >> 8;
-    data[i++] = val;
-    // signal
-    data[i++] = apds_tosend > 0 ? 1 : 0;
-
-    // Prepare upstream data transmission at the next possible time.
-    LMIC.setTxData2(10, (uint8_t *)data, 5, false);
-    PRINT_DEBUG(1,F("Packet queued"));
+  if(LMIC.getTxRxFlags().test(TxRxStatus::NEED_BATTERY_LEVEL)) {
+    LMIC.setBatteryLevel( 255 * (val - 270 )/(420-270) );
   }
-  // Next TX is scheduled after TX_COMPLETE event.
+
+  uint8_t prox;
+  apds.readProximity(prox);
+  val = prox * 100;
+  data[i++] = val >> 8;
+  data[i++] = val;
+  // signal
+  data[i++] = apds_tosend > 0 ? 1 : 0;
+
+  // Prepare upstream data transmission at the next possible time.
+  LMIC.setTxData2(10, (uint8_t *)data, 5, false);
+  PRINT_DEBUG(1,F("Packet queued"));
+  
 }
 
 // lmic_pins.dio[0]  = 9 => PCINT1
@@ -244,6 +213,7 @@ void setup() {
   pciSetup(lmic_pins.dio[0]);
   pciSetup(lmic_pins.dio[1]);
 
+  SPI.begin();
   // LMIC init
   os_init();
   LMIC.init();
@@ -261,22 +231,36 @@ void setup() {
   waitBatOk();
   configure_wdt();
   // Start job (sending automatically starts OTAA too)
-  do_send();
+  nextSend = os_getTime();
 }
 
 void loop() {
   rst_wdt();
-  OsDeltaTime to_wait = OSS.runloopOnce();
-  if (to_wait > OsDeltaTime(0)) {
-    powersave(to_wait, []() {
-      // Check if we are wakeup by external pin.
-      apdsInterrupt();
-      return apds_new;
-    });
-  }
-  // was wakeup by interrupt, send new state.
-  if (apds_new) {
-    apds_new = false;
-    sendjob.setCallbackRunnable(do_send);
+  OsDeltaTime freeTimeBeforeNextCall = LMIC.run();
+
+  // we have more than 10 ms to do some work.
+  // the test must be adapted from the time spend in other task
+ if (freeTimeBeforeNextCall > OsDeltaTime::from_ms(10)) {
+    // if time to send or wakeup
+    if (nextSend < os_getTime() || apds_new) {
+      if (LMIC.getOpMode().test(OpState::TXRXPEND)) {
+        PRINT_DEBUG(1, F("OpState::TXRXPEND, not sending"));
+      } else {
+        apds_new =false;
+        reset_and_do_send();
+      }
+    } else {
+      waitBatOk();
+
+      OsDeltaTime freeTimeBeforeSend = nextSend - os_getTime();
+      OsDeltaTime to_wait =
+          std::min(freeTimeBeforeNextCall, freeTimeBeforeSend);
+      // Go to sleep if we have nothing to do.
+      powersave(to_wait, []() {
+        // Check if we are wakeup by external pin.
+        apdsInterrupt();
+        return apds_new;
+      });
+    }
   }
 }
